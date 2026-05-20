@@ -1,0 +1,1921 @@
+---
+title: "QBS126Project"
+author: "Amartya Bhattacharya"
+date: "2026-05-20"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# 00_setup_check.R
+
+# Core
+library(tidyverse)
+library(mgcv)
+library(DTVEM)
+
+# State-space stuff
+library(OpenMx)   # DTVEM depends on this
+library(dlm)      # for baseline Kalman work
+library(ctsem)    # OU baseline competitor
+
+# Bayesian
+library(cmdstanr)
+
+# Check Stan compiles
+cmdstanr::check_cmdstan_toolchain()
+
+
+```
+
+```{r}
+# R/01_inspect.R
+
+library(tidyverse)
+library(here)
+
+# Path to one file - here() automatically uses your project root
+file_path <- here("Rdata", "P001_final.RData")
+
+# Load into a fresh environment so we can see what's inside
+env <- new.env()
+load(file_path, envir = env)
+
+# What objects are in this file?
+ls(env)
+```
+
+```{r}
+# The actual data lives in env$data
+df <- env$data
+
+# What does it look like?
+str(df)
+dim(df)
+colnames(df)
+head(df, 5)
+```
+
+```{r}
+# R/02_load_all.R
+# Goal: Combine all 40 participant .RData files into one tidy tibble.
+
+library(tidyverse)
+library(here)
+
+# === Step 1: List the files ===
+rdata_files <- list.files(here("Rdata"), 
+                          pattern = "_final\\.RData$", 
+                          full.names = TRUE)
+
+cat("Found", length(rdata_files), "participant files\n")
+# Should print 40 (or however many you have)
+
+load_one_participant <- function(file_path) {
+  # Extract participant ID from filename
+  pid <- str_extract(basename(file_path), "[Pp]\\d+")
+  
+  # Load into a fresh environment
+  env <- new.env()
+  load(file_path, envir = env)
+  
+  # Pull out the data frame
+  df <- env$data
+  
+  # === FIX: handle unnamed / NA-named columns ===
+  current_names <- names(df)
+  
+  # Identify problem columns
+  bad <- is.na(current_names) | current_names == ""
+  
+  if (any(bad)) {
+    # Give them placeholder names (we'll drop them right after)
+    current_names[bad] <- paste0("unnamed_", seq_len(sum(bad)))
+    names(df) <- current_names
+    
+    # Drop the unnamed columns — they're analysis artifacts, not real data
+    df <- df[, !startsWith(names(df), "unnamed_"), drop = FALSE]
+  }
+  
+  # === Now the rest of the processing ===
+  df$ID <- pid
+  df <- df %>% filter(!is.na(finish))
+  
+  df <- df %>%
+    mutate(
+      start_time = as.POSIXct(start, format = "%m/%d/%Y %H:%M"),
+      hrs_from_start = as.numeric(
+        difftime(start_time, min(start_time, na.rm = TRUE), units = "hours")
+      )
+    )
+  
+  df <- df %>%
+    arrange(start_time) %>%
+    mutate(gap_hrs = c(NA, diff(hrs_from_start)))
+  
+  df <- df %>%
+    select(ID, start_time, hrs_from_start, gap_hrs, everything())
+  
+  df
+}
+# === Step 3: Load all participants ===
+fisher_all <- map_dfr(rdata_files, load_one_participant)
+
+# === Step 4: Sanity checks ===
+cat("\n--- Sanity Checks ---\n")
+cat("Total rows (completed beeps across all participants):", nrow(fisher_all), "\n")
+cat("Number of unique participants:", n_distinct(fisher_all$ID), "\n\n")
+
+# Per-participant summary
+participant_summary <- fisher_all %>%
+  group_by(ID) %>%
+  summarise(
+    n_beeps = n(),
+    duration_days = (max(hrs_from_start) - min(hrs_from_start)) / 24,
+    median_gap_hrs = median(gap_hrs, na.rm = TRUE),
+    max_gap_hrs = max(gap_hrs, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+print(participant_summary, n = 50)
+
+# === Step 5: Save the combined dataset ===
+# Create output dir if it doesn't exist
+dir.create(here("data", "processed"), recursive = TRUE, showWarnings = FALSE)
+
+saveRDS(fisher_all, here("data", "processed", "fisher_all.rds"))
+saveRDS(participant_summary, here("data", "processed", "participant_summary.rds"))
+
+cat("\nSaved to: data/processed/fisher_all.rds\n")
+```
+
+```{r}
+n_distinct(fisher_all$ID)
+```
+
+```{r}
+# After loading fisher_all, add session boundaries at gaps > 72 hours
+fisher_all <- fisher_all %>%
+  group_by(ID) %>%
+  arrange(start_time) %>%
+  mutate(
+    session = cumsum(replace_na(gap_hrs > 72, FALSE)) + 1
+  ) %>%
+  ungroup()
+
+# How many participants have multi-session data?
+fisher_all %>% 
+  group_by(ID) %>% 
+  summarise(n_sessions = max(session), .groups = "drop") %>%
+  count(n_sessions)
+```
+
+```{r}
+library(ggplot2)
+
+# Pick 4 participants spanning low/medium/high beep counts
+sample_ids <- c("P001", "P040", "P145", "P202")
+items_to_plot <- c("sad", "anxious", "angry", "energetic")
+
+# Check those column names actually exist first
+items_to_plot[items_to_plot %in% colnames(fisher_all)]
+```
+
+```{r}
+sample_ids <- c("P001", "P040", "P145", "P202")
+items_to_plot <- c("down", "worried", "angry", "energetic")
+
+fisher_all %>%
+  filter(ID %in% sample_ids) %>%
+  select(ID, hrs_from_start, all_of(items_to_plot)) %>%
+  pivot_longer(all_of(items_to_plot), names_to = "item", values_to = "rating") %>%
+  ggplot(aes(x = hrs_from_start, y = rating, color = item)) +
+  geom_line(alpha = 0.6, linewidth = 0.4) +
+  geom_point(size = 0.5, alpha = 0.7) +
+  facet_grid(ID ~ item, scales = "free_y") +
+  theme_minimal() +
+  labs(title = "EMA trajectories for 4 participants",
+       x = "Hours from study start",
+       y = "Rating (0–100)") +
+  theme(legend.position = "none",
+        strip.text = element_text(size = 9))
+
+# Save it
+ggsave(here("output", "figures", "01_raw_timeseries.png"),
+       width = 12, height = 8, dpi = 150)
+```
+
+```{r}
+# R/05_extract_groups.R (fixed)
+
+library(tidyverse)
+library(here)
+
+rdata_files <- list.files(here("Rdata"), 
+                          pattern = "_final\\.RData$", 
+                          full.names = TRUE)
+
+inspect_one <- function(file_path) {
+  pid <- str_extract(basename(file_path), "[Pp]\\d+")
+  env <- new.env()
+  load(file_path, envir = env)
+  
+  # Just record what objects exist and their lengths
+  obj_summary <- ls(env)
+  
+  # Try to find any objects that could be diagnostic labels
+  # (single string/integer, or short labeled vector)
+  candidates <- character(0)
+  for (obj in obj_summary) {
+    val <- env[[obj]]
+    if (length(val) == 1 && (is.character(val) || is.factor(val))) {
+      candidates <- c(candidates, paste0(obj, "=", val))
+    }
+  }
+  
+  tibble(
+    ID = pid,
+    n_objects = length(obj_summary),
+    candidate_labels = paste(candidates, collapse = "; ")
+  )
+}
+
+groups_df <- map_dfr(rdata_files, inspect_one)
+print(groups_df, n = 40)
+
+# Confirmation: no per-participant diagnostic label embedded in files
+cat("\nConfirmed: no diagnostic group labels in the .RData files.\n")
+cat("We'll get them from Fisher et al. 2017 Table 1 instead.\n")
+```
+
+```{r}
+# R/06_per_person_smooths.R
+
+library(tidyverse)
+library(here)
+library(mgcv)
+
+# === Load data ===
+fisher_all <- readRDS(here("data", "processed", "fisher_all.rds"))
+
+if (!"session" %in% colnames(fisher_all)) {
+  fisher_all <- fisher_all %>%
+    group_by(ID) %>%
+    arrange(start_time) %>%
+    mutate(session = cumsum(replace_na(gap_hrs > 72, FALSE)) + 1) %>%
+    ungroup()
+}
+
+# === Pick target item ===
+target_item <- "down"
+
+# === Build lag-augmented dataset ===
+# Each row: (current value, lagged value, lag distance, person)
+
+make_lag_data <- function(df, item, max_lag = 14) {
+  df <- df %>% 
+    filter(session == 1) %>%
+    drop_na(all_of(item)) %>%
+    group_by(ID) %>%
+    arrange(start_time) %>%
+    mutate(
+      y_z = as.numeric(scale(.data[[item]])),
+      beep_num = row_number()
+    ) %>%
+    ungroup()
+  
+  expand_lags <- function(person_df) {
+    map_dfr(1:max_lag, function(k) {
+      person_df %>%
+        mutate(
+          y_lagged = lag(y_z, k),
+          lag_value = k
+        ) %>%
+        select(ID, beep_num, lag_value, y_now = y_z, y_lagged)
+    })
+  }
+  
+  df %>%
+    group_split(ID) %>%
+    map_dfr(expand_lags) %>%
+    drop_na()
+}
+
+cat("Building lag-augmented dataset for:", target_item, "\n")
+lag_data <- make_lag_data(fisher_all, target_item)
+cat("Total rows:", nrow(lag_data), "\n")
+cat("Participants:", n_distinct(lag_data$ID), "\n")
+
+lag_data$ID <- as.factor(lag_data$ID)
+
+# === Factor-smooth GAMM ===
+# Model: y_now = (population smooth over lag) + (person-specific smooth over lag)
+#        all multiplied by y_lagged so it's a lag-effect curve
+#
+# This is the core of DTVEM-RE Stage 1 — each person gets their own smooth curve
+# with shrinkage toward the population mean.
+
+cat("\nFitting factor-smooth GAMM... (a few minutes)\n")
+
+fs_gamm <- bam(
+  y_now ~ s(lag_value, k = 8, by = y_lagged) +
+          s(lag_value, ID, bs = "fs", k = 8, by = y_lagged),
+  data = lag_data,
+  discrete = TRUE,
+  method = "fREML"
+)
+
+cat("\nDone fitting.\n")
+cat("Model summary:\n")
+print(summary(fs_gamm))
+
+# === Build predictions for plotting ===
+# Predict y_now / y_lagged at every lag for every person
+# This gives the "effect of lagged value on current value at each lag"
+
+pred_grid <- expand_grid(
+  ID = unique(lag_data$ID),
+  lag_value = seq(1, 14, by = 0.25)
+) %>%
+  mutate(y_lagged = 1)  # standardized
+
+pred_grid$fitted <- predict(fs_gamm, newdata = pred_grid)
+
+# === Plot 1: spaghetti plot — all 40 person-specific curves ===
+dir.create(here("output", "person_smooths"), recursive = TRUE, showWarnings = FALSE)
+
+p1 <- ggplot(pred_grid, aes(x = lag_value, y = fitted)) +
+  geom_line(aes(group = ID), alpha = 0.25, color = "steelblue") +
+  stat_summary(fun = mean, geom = "line",
+               aes(group = 1), color = "red", linewidth = 1.4) +
+  labs(
+    title = paste0("Person-specific lag-effect curves: ", target_item, " predicting itself"),
+    subtitle = paste0("Each blue line = one participant. Red line = population average. N = ",
+                      n_distinct(lag_data$ID)),
+    x = "Lag (beeps)",
+    y = "Predicted effect on current value (z-scaled)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+
+print(p1)
+ggsave(here("output", "person_smooths", paste0(target_item, "_AR_spaghetti.png")),
+       p1, width = 10, height = 6, dpi = 150)
+
+# === Plot 2: heatmap — sort participants by their lag-1 effect ===
+person_lag1 <- pred_grid %>%
+  filter(abs(lag_value - 1) < 0.1) %>%
+  group_by(ID) %>%
+  summarise(lag1_effect = mean(fitted), .groups = "drop") %>%
+  arrange(lag1_effect)
+
+pred_grid_sorted <- pred_grid %>%
+  mutate(ID = factor(ID, levels = person_lag1$ID))
+
+p2 <- ggplot(pred_grid_sorted, aes(x = lag_value, y = ID, fill = fitted)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0,
+                       name = "Effect") +
+  labs(
+    title = paste0("Person-specific lag-effect curves: ", target_item, " AR"),
+    subtitle = "Participants sorted by lag-1 effect magnitude",
+    x = "Lag (beeps)",
+    y = "Participant"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"),
+        axis.text.y = element_text(size = 7))
+
+print(p2)
+ggsave(here("output", "person_smooths", paste0(target_item, "_AR_heatmap.png")),
+       p2, width = 10, height = 8, dpi = 150)
+
+# === Numerical summary: variation in lag-1 effect across people ===
+cat("\n=== Variation in lag-1 effect across participants ===\n")
+cat("Mean lag-1 effect:", round(mean(person_lag1$lag1_effect), 3), "\n")
+cat("SD lag-1 effect:", round(sd(person_lag1$lag1_effect), 3), "\n")
+cat("Min lag-1 effect:", round(min(person_lag1$lag1_effect), 3), "\n")
+cat("Max lag-1 effect:", round(max(person_lag1$lag1_effect), 3), "\n")
+
+cat("\nLook at the spaghetti plot:\n")
+cat("- If blue lines spread widely from the red → real person-specific variation → DTVEM-RE has a target\n")
+cat("- If blue lines collapse onto red → no person-specific variation → reconsider\n")
+```
+
+```{r}
+# R/07_per_person_replication.R
+# Goal: Replicate the per-person heterogeneity finding from `down` on
+# `worried` (anxiety) and `energetic` (positive affect).
+# If the same pattern shows up, DTVEM-RE has robust empirical motivation.
+
+library(tidyverse)
+library(here)
+library(mgcv)
+
+# === Load data ===
+fisher_all <- readRDS(here("data", "processed", "fisher_all.rds"))
+
+if (!"session" %in% colnames(fisher_all)) {
+  fisher_all <- fisher_all %>%
+    group_by(ID) %>%
+    arrange(start_time) %>%
+    mutate(session = cumsum(replace_na(gap_hrs > 72, FALSE)) + 1) %>%
+    ungroup()
+}
+
+dir.create(here("output", "person_smooths"), recursive = TRUE, showWarnings = FALSE)
+
+# === Reusable lag-data builder ===
+make_lag_data <- function(df, item, max_lag = 14) {
+  df <- df %>% 
+    filter(session == 1) %>%
+    drop_na(all_of(item)) %>%
+    group_by(ID) %>%
+    arrange(start_time) %>%
+    mutate(
+      y_z = as.numeric(scale(.data[[item]])),
+      beep_num = row_number()
+    ) %>%
+    ungroup()
+  
+  expand_lags <- function(person_df) {
+    map_dfr(1:max_lag, function(k) {
+      person_df %>%
+        mutate(
+          y_lagged = lag(y_z, k),
+          lag_value = k
+        ) %>%
+        select(ID, beep_num, lag_value, y_now = y_z, y_lagged)
+    })
+  }
+  
+  df %>%
+    group_split(ID) %>%
+    map_dfr(expand_lags) %>%
+    drop_na()
+}
+
+# === Function to fit GAMM and make plots for one item ===
+fit_and_plot <- function(item) {
+  cat("\n\n=================================\n")
+  cat("ITEM:", item, "\n")
+  cat("=================================\n")
+  
+  lag_data <- make_lag_data(fisher_all, item)
+  cat("Rows:", nrow(lag_data), 
+      "| Participants:", n_distinct(lag_data$ID), "\n")
+  lag_data$ID <- as.factor(lag_data$ID)
+  
+  cat("Fitting factor-smooth GAMM...\n")
+  fs_gamm <- bam(
+    y_now ~ s(lag_value, k = 8, by = y_lagged) +
+            s(lag_value, ID, bs = "fs", k = 8, by = y_lagged),
+    data = lag_data,
+    discrete = TRUE,
+    method = "fREML"
+  )
+  
+  # Prediction grid
+  pred_grid <- expand_grid(
+    ID = unique(lag_data$ID),
+    lag_value = seq(1, 14, by = 0.25)
+  ) %>%
+    mutate(y_lagged = 1)
+  
+  pred_grid$fitted <- predict(fs_gamm, newdata = pred_grid)
+  
+  # Spaghetti plot
+  p1 <- ggplot(pred_grid, aes(x = lag_value, y = fitted)) +
+    geom_line(aes(group = ID), alpha = 0.25, color = "steelblue") +
+    stat_summary(fun = mean, geom = "line",
+                 aes(group = 1), color = "red", linewidth = 1.4) +
+    labs(
+      title = paste0("Person-specific lag-effect curves: ", item, " AR"),
+      subtitle = paste0("N = ", n_distinct(lag_data$ID)),
+      x = "Lag (beeps)",
+      y = "Predicted effect (z-scaled)"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(plot.title = element_text(face = "bold"))
+  
+  ggsave(here("output", "person_smooths", paste0(item, "_AR_spaghetti.png")),
+         p1, width = 10, height = 6, dpi = 150)
+  
+  # Heatmap
+  person_lag1 <- pred_grid %>%
+    filter(abs(lag_value - 1) < 0.1) %>%
+    group_by(ID) %>%
+    summarise(lag1_effect = mean(fitted), .groups = "drop") %>%
+    arrange(lag1_effect)
+  
+  pred_grid_sorted <- pred_grid %>%
+    mutate(ID = factor(ID, levels = person_lag1$ID))
+  
+  p2 <- ggplot(pred_grid_sorted, aes(x = lag_value, y = ID, fill = fitted)) +
+    geom_tile() +
+    scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0,
+                         name = "Effect") +
+    labs(
+      title = paste0("Person-specific lag-effect curves: ", item, " AR"),
+      subtitle = "Sorted by lag-1 effect magnitude",
+      x = "Lag (beeps)",
+      y = "Participant"
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(plot.title = element_text(face = "bold"),
+          axis.text.y = element_text(size = 7))
+  
+  ggsave(here("output", "person_smooths", paste0(item, "_AR_heatmap.png")),
+         p2, width = 10, height = 8, dpi = 150)
+  
+  # Numerical summary
+  summary_stats <- tibble(
+    item = item,
+    n_persons = n_distinct(lag_data$ID),
+    mean_lag1 = mean(person_lag1$lag1_effect),
+    sd_lag1 = sd(person_lag1$lag1_effect),
+    min_lag1 = min(person_lag1$lag1_effect),
+    max_lag1 = max(person_lag1$lag1_effect),
+    range_lag1 = max_lag1 - min_lag1
+  )
+  
+  cat("\nLag-1 effect summary for", item, ":\n")
+  print(summary_stats)
+  
+  # Show the two plots
+  print(p1)
+  
+  list(stats = summary_stats, person_lag1 = person_lag1, pred_grid = pred_grid)
+}
+
+# === Run for worried and energetic ===
+res_worried   <- fit_and_plot("worried")
+res_energetic <- fit_and_plot("energetic")
+
+# === Combined comparison ===
+# Pull in the `down` results from before by re-fitting (so all three are comparable)
+res_down <- fit_and_plot("down")
+
+# Stack the lag-1 distributions
+all_lag1 <- bind_rows(
+  res_down$person_lag1   %>% mutate(item = "down"),
+  res_worried$person_lag1 %>% mutate(item = "worried"),
+  res_energetic$person_lag1 %>% mutate(item = "energetic")
+)
+
+# Boxplot/jitter: distribution of person-specific lag-1 effects across items
+p_comparison <- ggplot(all_lag1, aes(x = item, y = lag1_effect)) +
+  geom_boxplot(width = 0.5, alpha = 0.4, fill = "steelblue") +
+  geom_jitter(width = 0.15, alpha = 0.6, size = 1.5) +
+  labs(
+    title = "Person-specific lag-1 AR effects across items",
+    subtitle = "Each dot = one participant. Spread shows between-person heterogeneity.",
+    x = "EMA item",
+    y = "Lag-1 autoregressive effect"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+
+print(p_comparison)
+ggsave(here("output", "person_smooths", "comparison_lag1_distributions.png"),
+       p_comparison, width = 8, height = 6, dpi = 150)
+
+# === Combined summary table ===
+combined <- bind_rows(res_down$stats, res_worried$stats, res_energetic$stats)
+cat("\n\n=== COMBINED SUMMARY ===\n")
+print(combined)
+
+# Save everything
+saveRDS(list(down = res_down, worried = res_worried, energetic = res_energetic),
+        here("output", "person_smooths", "per_person_results.rds"))
+
+cat("\nDone. Three pairs of plots saved to output/person_smooths/.\n")
+cat("Key question: does the spread for `worried` and `energetic` look as wide as for `down`?\n")
+```
+
+```{r}
+# R/08_fit_stan_lag1.R
+# Fit the single-item hierarchical lag-1 VAR (DTVEM-RE simplified)
+# on Fisher's `down` data.
+
+library(tidyverse)
+library(here)
+library(cmdstanr)
+library(posterior)
+library(bayesplot)
+
+# === Load and prep data ===
+fisher_all <- readRDS(here("data", "processed", "fisher_all.rds"))
+
+if (!"session" %in% colnames(fisher_all)) {
+  fisher_all <- fisher_all %>%
+    group_by(ID) %>%
+    arrange(start_time) %>%
+    mutate(session = cumsum(replace_na(gap_hrs > 72, FALSE)) + 1) %>%
+    ungroup()
+}
+
+target_item <- "down"
+
+# Build lag-1 dataset
+prep <- fisher_all %>%
+  filter(session == 1) %>%
+  drop_na(all_of(target_item)) %>%
+  group_by(ID) %>%
+  arrange(start_time) %>%
+  mutate(
+    y_z = as.numeric(scale(.data[[target_item]])),
+    y_lag1 = lag(y_z, 1)
+  ) %>%
+  ungroup() %>%
+  drop_na(y_z, y_lag1) %>%
+  mutate(person = as.integer(as.factor(ID)))
+
+cat("Total observations after lag construction:", nrow(prep), "\n")
+cat("Number of people:", n_distinct(prep$person), "\n")
+
+# === Build Stan data list ===
+stan_data <- list(
+  N = nrow(prep),
+  P = n_distinct(prep$person),
+  person = prep$person,
+  y = prep$y_z,
+  y_lag1 = prep$y_lag1
+)
+
+# === Compile the model ===
+cat("\nCompiling Stan model... (~30 sec on first run)\n")
+mod <- cmdstan_model(here("stan", "dtvem_re_lag1.stan"))
+
+# === Fit ===
+cat("\nFitting... (~2-5 minutes)\n")
+fit <- mod$sample(
+  data = stan_data,
+  chains = 4,
+  parallel_chains = 4,
+  iter_warmup = 1000,
+  iter_sampling = 1000,
+  seed = 42,
+  refresh = 200
+)
+
+# === Diagnostics ===
+cat("\n=== Convergence diagnostics ===\n")
+print(fit$diagnostic_summary())
+
+cat("\n=== Population-level parameters ===\n")
+print(fit$summary(variables = c("mu_a", "tau_a", "sigma_mean", "sigma_sd",
+                                "prop_var_explained_by_persons")))
+
+# === Person-specific posterior summary ===
+person_summary <- fit$summary(variables = "a") %>%
+  mutate(person = as.integer(str_extract(variable, "\\d+"))) %>%
+  arrange(person)
+
+cat("\n=== First 10 person-specific lag-1 coefficients ===\n")
+print(person_summary %>% select(person, mean, sd, q5, q95) %>% head(10))
+
+# === Compare to pilot GAMM estimates ===
+pilot <- readRDS(here("output", "person_smooths", "per_person_results.rds"))
+gamm_lag1 <- pilot$down$person_lag1 %>%
+  mutate(ID = as.character(ID)) %>%
+  arrange(ID)
+
+person_summary <- person_summary %>%
+  mutate(ID = levels(as.factor(prep$ID))[person]) %>%
+  left_join(gamm_lag1, by = "ID")
+
+# Correlation between Stan posterior means and GAMM estimates
+r <- cor(person_summary$mean, person_summary$lag1_effect)
+cat("\n=== Correlation between Stan posterior mean and GAMM estimate ===\n")
+cat("r =", round(r, 3), "\n")
+cat("(Hypothesis 2b said this should be > 0.85)\n")
+
+# === Save fit and plots ===
+dir.create(here("output", "stan_fits"), recursive = TRUE, showWarnings = FALSE)
+fit$save_object(here("output", "stan_fits", "lag1_down.rds"))
+
+# Plot 1: posterior of mu_a and tau_a
+post_draws <- fit$draws(variables = c("mu_a", "tau_a"), format = "df")
+
+p1 <- mcmc_dens(fit$draws(c("mu_a", "tau_a")))
+ggsave(here("output", "stan_fits", "01_mu_tau_posteriors.png"),
+       p1, width = 10, height = 4, dpi = 150)
+
+# Plot 2: Stan vs GAMM person-specific estimates
+p2 <- ggplot(person_summary, aes(x = lag1_effect, y = mean)) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "grey50") +
+  geom_errorbar(aes(ymin = q5, ymax = q95), color = "steelblue", alpha = 0.5) +
+  geom_point(size = 2) +
+  labs(
+    title = paste0("Stan vs GAMM person-specific lag-1 estimates (", target_item, ")"),
+    subtitle = paste0("r = ", round(r, 3),
+                      "; Dashed line = perfect agreement"),
+    x = "GAMM estimate (pilot)",
+    y = "Stan posterior mean (with 90% CI)"
+  ) +
+  theme_minimal(base_size = 12)
+
+print(p2)
+ggsave(here("output", "stan_fits", "02_stan_vs_gamm.png"),
+       p2, width = 8, height = 8, dpi = 150)
+
+# Plot 3: caterpillar plot of all person-specific coefficients
+p3 <- person_summary %>%
+  arrange(mean) %>%
+  mutate(rank = row_number()) %>%
+  ggplot(aes(x = rank, y = mean)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_hline(yintercept = mean(person_summary$mean), 
+             color = "red", linewidth = 1) +
+  geom_errorbar(aes(ymin = q5, ymax = q95), color = "steelblue", alpha = 0.7) +
+  geom_point(size = 2) +
+  labs(
+    title = "Person-specific lag-1 coefficients (sorted)",
+    subtitle = "Red line = population mean μ_a; Bars = 90% credible intervals",
+    x = "Person (sorted by posterior mean)",
+    y = "Lag-1 AR coefficient"
+  ) +
+  theme_minimal(base_size = 12)
+
+print(p3)
+ggsave(here("output", "stan_fits", "03_person_caterpillar.png"),
+       p3, width = 10, height = 6, dpi = 150)
+
+cat("\nDone. Plots saved to output/stan_fits/.\n")
+```
+
+```{r}
+# R/10_refit_energetic_v2.R
+# Refit the energetic model with the non-centered sigma parameterization
+
+library(tidyverse)
+library(here)
+library(cmdstanr)
+
+fisher_all <- readRDS(here("data", "processed", "fisher_all.rds"))
+
+if (!"session" %in% colnames(fisher_all)) {
+  fisher_all <- fisher_all %>%
+    group_by(ID) %>%
+    arrange(start_time) %>%
+    mutate(session = cumsum(replace_na(gap_hrs > 72, FALSE)) + 1) %>%
+    ungroup()
+}
+
+prep <- fisher_all %>%
+  filter(session == 1) %>%
+  drop_na(energetic) %>%
+  group_by(ID) %>%
+  arrange(start_time) %>%
+  mutate(y_z = as.numeric(scale(energetic)), y_lag1 = lag(y_z, 1)) %>%
+  ungroup() %>%
+  drop_na(y_z, y_lag1) %>%
+  mutate(person = as.integer(as.factor(ID)))
+
+stan_data <- list(
+  N = nrow(prep),
+  P = n_distinct(prep$person),
+  person = prep$person,
+  y = prep$y_z,
+  y_lag1 = prep$y_lag1
+)
+
+cat("Compiling v2 model...\n")
+mod_v2 <- cmdstan_model(here("stan", "dtvem_re_lag1_v2.stan"))
+
+cat("Fitting...\n")
+fit_v2 <- mod_v2$sample(
+  data = stan_data,
+  chains = 4,
+  parallel_chains = 4,
+  iter_warmup = 1000,
+  iter_sampling = 1000,
+  seed = 42,
+  refresh = 200,
+  adapt_delta = 0.95   # slightly tighter step size for safety
+)
+
+cat("\n=== Diagnostics for v2 ===\n")
+print(fit_v2$diagnostic_summary())
+
+cat("\n=== Population-level (v2) ===\n")
+print(fit_v2$summary(variables = c("mu_a", "tau_a", "sigma_mean", "sigma_sd",
+                                    "prop_var_explained_by_persons")))
+
+# Save
+fit_v2$save_object(here("output", "stan_fits", "lag1_energetic_v2.rds"))
+```
+
+```{r}
+# R/11_refit_all_v2.R
+# Refit all three items with the v2 (non-centered sigma) model for consistency
+
+library(tidyverse)
+library(here)
+library(cmdstanr)
+
+fisher_all <- readRDS(here("data", "processed", "fisher_all.rds"))
+
+if (!"session" %in% colnames(fisher_all)) {
+  fisher_all <- fisher_all %>%
+    group_by(ID) %>%
+    arrange(start_time) %>%
+    mutate(session = cumsum(replace_na(gap_hrs > 72, FALSE)) + 1) %>%
+    ungroup()
+}
+
+mod_v2 <- cmdstan_model(here("stan", "dtvem_re_lag1_v2.stan"))
+
+fit_one <- function(item) {
+  cat("\n=== Fitting v2 for:", item, "===\n")
+  
+  prep <- fisher_all %>%
+    filter(session == 1) %>%
+    drop_na(all_of(item)) %>%
+    group_by(ID) %>%
+    arrange(start_time) %>%
+    mutate(y_z = as.numeric(scale(.data[[item]])), y_lag1 = lag(y_z, 1)) %>%
+    ungroup() %>%
+    drop_na(y_z, y_lag1) %>%
+    mutate(person = as.integer(as.factor(ID)))
+  
+  stan_data <- list(
+    N = nrow(prep),
+    P = n_distinct(prep$person),
+    person = prep$person,
+    y = prep$y_z,
+    y_lag1 = prep$y_lag1
+  )
+  
+  fit <- mod_v2$sample(
+    data = stan_data,
+    chains = 4, parallel_chains = 4,
+    iter_warmup = 1000, iter_sampling = 1000,
+    seed = 42, refresh = 0, adapt_delta = 0.95
+  )
+  
+  diag <- fit$diagnostic_summary()
+  cat("Divergences:", sum(diag$num_divergent), 
+      "| Min EBFMI:", round(min(diag$ebfmi), 3), "\n")
+  
+  fit$save_object(here("output", "stan_fits", paste0("lag1_", item, "_v2.rds")))
+  
+  fit$summary(variables = c("mu_a", "tau_a", "sigma_mean", "sigma_sd",
+                             "prop_var_explained_by_persons")) %>%
+    mutate(item = item)
+}
+
+results <- map_dfr(c("down", "worried", "energetic"), fit_one)
+
+cat("\n\n=== FINAL v2 RESULTS (all three items) ===\n")
+print(results %>% 
+        select(item, variable, mean, sd, q5, q95) %>% 
+        mutate(across(where(is.numeric), ~round(.x, 3))))
+
+write_csv(results, here("output", "stan_fits", "v2_all_items_summary.csv"))
+```
+
+```{r}
+# R/12_simulation_aim1.R
+# Aim 1: simulation study validating DTVEM-RE parameter recovery.
+# Design: 4 heterogeneity levels (tau_a = 0, 0.10, 0.20, 0.30)
+#         × 30 replicates each = 120 total fits.
+
+library(tidyverse)
+library(here)
+library(cmdstanr)
+library(posterior)
+
+# === Settings ===
+N_PERSONS <- 40
+T_OBS <- 130
+TRUE_MU <- 0.4
+TAU_LEVELS <- c(0, 0.10, 0.20, 0.30)
+N_REPS <- 30
+SEED_BASE <- 12345
+TOTAL_FITS <- length(TAU_LEVELS) * N_REPS
+
+# Set up logging
+dir.create(here("output", "simulation"), recursive = TRUE, showWarnings = FALSE)
+log_file <- here("output", "simulation", "sim_log.txt")
+cat(sprintf("Simulation started at %s\n", Sys.time()), file = log_file)
+cat(sprintf("Total fits planned: %d\n\n", TOTAL_FITS), file = log_file, append = TRUE)
+
+# === Generate one dataset ===
+simulate_data <- function(mu_a, tau_a, sigma_mean = 0.9, 
+                          N = N_PERSONS, T = T_OBS, seed = 1) {
+  set.seed(seed)
+  
+  a_true <- rnorm(N, mu_a, tau_a)
+  a_true <- pmax(pmin(a_true, 0.95), -0.95)
+  sigma_true <- rlnorm(N, log(sigma_mean), 0.1)
+  
+  rows <- list()
+  for (i in 1:N) {
+    y <- numeric(T)
+    y[1] <- rnorm(1, 0, sigma_true[i] / sqrt(1 - a_true[i]^2))
+    for (t in 2:T) {
+      y[t] <- a_true[i] * y[t-1] + rnorm(1, 0, sigma_true[i])
+    }
+    y_z <- y - mean(y)   # demean but don't scale
+    rows[[i]] <- tibble(
+      person = i,
+      t = 1:T,
+      y_z = y_z,
+      y_lag1 = lag(y_z, 1)
+    )
+  }
+  
+  df <- bind_rows(rows) %>% drop_na(y_lag1)
+  
+  list(
+    df = df,
+    a_true = a_true,
+    sigma_true = sigma_true,
+    mu_a_true = mu_a,
+    tau_a_true = tau_a
+  )
+}
+
+# === Compile model once ===
+cat("Compiling v2 Stan model...\n")
+mod <- cmdstan_model(here("stan", "dtvem_re_lag1_v2.stan"))
+cat("Compilation done.\n\n")
+
+# === Run one replicate ===
+run_one_replicate <- function(tau_true, rep_id) {
+  seed <- SEED_BASE + tau_true * 1000 + rep_id
+  
+  sim <- simulate_data(mu_a = TRUE_MU, tau_a = tau_true, seed = seed)
+  
+  stan_data <- list(
+    N = nrow(sim$df),
+    P = N_PERSONS,
+    person = sim$df$person,
+    y = sim$df$y_z,
+    y_lag1 = sim$df$y_lag1
+  )
+  
+  fit <- mod$sample(
+    data = stan_data,
+    chains = 2, parallel_chains = 2,
+    iter_warmup = 500, iter_sampling = 500,
+    seed = seed, refresh = 0, adapt_delta = 0.95,
+    show_messages = FALSE, show_exceptions = FALSE
+  )
+  
+  diag <- fit$diagnostic_summary(quiet = TRUE)
+  
+  pop_summary <- fit$summary(variables = c("mu_a", "tau_a"))
+  mu_row <- pop_summary[pop_summary$variable == "mu_a", ]
+  tau_row <- pop_summary[pop_summary$variable == "tau_a", ]
+  
+  tibble(
+    tau_true = tau_true,
+    rep_id = rep_id,
+    mu_true = TRUE_MU,
+    mu_est = mu_row$mean,
+    mu_q5 = mu_row$q5,
+    mu_q95 = mu_row$q95,
+    mu_covered = mu_row$q5 <= TRUE_MU & TRUE_MU <= mu_row$q95,
+    tau_est = tau_row$mean,
+    tau_q5 = tau_row$q5,
+    tau_q95 = tau_row$q95,
+    tau_covered = tau_row$q5 <= tau_true & tau_true <= tau_row$q95,
+    n_divergent = sum(diag$num_divergent),
+    min_ebfmi = min(diag$ebfmi)
+  )
+}
+
+# === Main loop ===
+results <- list()
+start_time <- Sys.time()
+fit_counter <- 0
+
+for (tau_level in TAU_LEVELS) {
+  for (rep in 1:N_REPS) {
+    fit_counter <- fit_counter + 1
+    
+    # Progress with ETA
+    elapsed_min <- as.numeric(difftime(Sys.time(), start_time, units = "mins"))
+    if (fit_counter > 1) {
+      avg_min_per_fit <- elapsed_min / (fit_counter - 1)
+      remaining_min <- avg_min_per_fit * (TOTAL_FITS - fit_counter + 1)
+      eta_str <- sprintf(" | ETA: %.1f min remaining", remaining_min)
+    } else {
+      eta_str <- ""
+    }
+    
+    msg <- sprintf("[%s] Fit %d/%d: tau_true=%.2f rep=%d%s\n",
+                   format(Sys.time(), "%H:%M:%S"), 
+                   fit_counter, TOTAL_FITS, 
+                   tau_level, rep, eta_str)
+    cat(msg)
+    cat(msg, file = log_file, append = TRUE)
+    
+    res <- tryCatch(
+      run_one_replicate(tau_level, rep),
+      error = function(e) {
+        err_msg <- sprintf("  ERROR: %s\n", conditionMessage(e))
+        cat(err_msg)
+        cat(err_msg, file = log_file, append = TRUE)
+        NULL
+      }
+    )
+    
+    if (!is.null(res)) results[[length(results) + 1]] <- res
+    
+    # Save partial results every 10 fits
+    if (fit_counter %% 10 == 0) {
+      saveRDS(bind_rows(results), 
+              here("output", "simulation", "sim_results_partial.rds"))
+      cat(sprintf("  (Saved %d partial results)\n", length(results)))
+    }
+  }
+}
+
+total_min <- as.numeric(difftime(Sys.time(), start_time, units = "mins"))
+final_msg <- sprintf("\nDone! Total time: %.1f minutes. Successful fits: %d/%d\n",
+                     total_min, length(results), TOTAL_FITS)
+cat(final_msg)
+cat(final_msg, file = log_file, append = TRUE)
+
+sim_results <- bind_rows(results)
+saveRDS(sim_results, here("output", "simulation", "sim_results.rds"))
+
+# === Summary ===
+summary_table <- sim_results %>%
+  group_by(tau_true) %>%
+  summarise(
+    n_reps = n(),
+    mu_mean_est = mean(mu_est),
+    mu_bias = mean(mu_est) - TRUE_MU,
+    mu_rmse = sqrt(mean((mu_est - TRUE_MU)^2)),
+    mu_coverage = mean(mu_covered),
+    tau_mean_est = mean(tau_est),
+    tau_bias = mean(tau_est - tau_true),
+    tau_rmse = sqrt(mean((tau_est - tau_true)^2)),
+    tau_coverage = mean(tau_covered),
+    pct_clean_diagnostics = mean(n_divergent == 0 & min_ebfmi > 0.3),
+    .groups = "drop"
+  )
+
+cat("\n=== SIMULATION SUMMARY ===\n")
+print(summary_table %>% mutate(across(where(is.numeric), ~round(.x, 3))))
+
+write_csv(summary_table, here("output", "simulation", "sim_summary.csv"))
+
+# === Plots ===
+
+# 1. Tau recovery plot
+p_tau <- sim_results %>%
+  ggplot(aes(x = factor(tau_true), y = tau_est)) +
+  geom_hline(data = tibble(tau_true = TAU_LEVELS), 
+             aes(yintercept = tau_true), 
+             color = "red", linetype = "dashed") +
+  geom_boxplot(fill = "steelblue", alpha = 0.3) +
+  geom_jitter(width = 0.15, alpha = 0.5) +
+  labs(
+    title = "DTVEM-RE recovery of between-person SD (τ_a)",
+    subtitle = "Red dashes = true values; Each point = one simulation replicate",
+    x = "True τ_a",
+    y = "Estimated τ_a (posterior mean)"
+  ) +
+  theme_minimal(base_size = 12)
+
+print(p_tau)
+ggsave(here("output", "simulation", "tau_recovery.png"),
+       p_tau, width = 8, height = 6, dpi = 150)
+
+# 2. Mu recovery plot
+p_mu <- sim_results %>%
+  ggplot(aes(x = factor(tau_true), y = mu_est)) +
+  geom_hline(yintercept = TRUE_MU, color = "red", linetype = "dashed") +
+  geom_boxplot(fill = "steelblue", alpha = 0.3) +
+  geom_jitter(width = 0.15, alpha = 0.5) +
+  labs(
+    title = "DTVEM-RE recovery of population mean (μ_a)",
+    subtitle = sprintf("Red dashes = true μ_a = %.2f; Each point = one replicate", TRUE_MU),
+    x = "True τ_a",
+    y = "Estimated μ_a (posterior mean)"
+  ) +
+  theme_minimal(base_size = 12)
+
+print(p_mu)
+ggsave(here("output", "simulation", "mu_recovery.png"),
+       p_mu, width = 8, height = 6, dpi = 150)
+
+# 3. Coverage plot
+p_coverage <- summary_table %>%
+  select(tau_true, mu_coverage, tau_coverage) %>%
+  pivot_longer(c(mu_coverage, tau_coverage), 
+               names_to = "param", values_to = "coverage") %>%
+  mutate(param = if_else(param == "mu_coverage", "μ_a", "τ_a")) %>%
+  ggplot(aes(x = factor(tau_true), y = coverage, fill = param)) +
+  geom_col(position = "dodge") +
+  geom_hline(yintercept = 0.90, linetype = "dashed", color = "red") +
+  ylim(0, 1) +
+  labs(
+    title = "90% credible interval coverage",
+    subtitle = "Red dashed = nominal 90% coverage",
+    x = "True τ_a",
+    y = "Empirical coverage",
+    fill = "Parameter"
+  ) +
+  theme_minimal(base_size = 12) +
+  scale_fill_manual(values = c("μ_a" = "steelblue", "τ_a" = "coral"))
+
+print(p_coverage)
+ggsave(here("output", "simulation", "coverage.png"),
+       p_coverage, width = 8, height = 6, dpi = 150)
+
+cat("\nAll done. See output/simulation/ for results and plots.\n")
+```
+
+```{r}
+# R/13_held_out_prediction.R
+# Held-out prediction comparison across four lag-1 methods.
+# Holds out last 3 days (~12 beeps) per person; fits on the rest.
+# Compares predictive log-likelihood.
+
+library(tidyverse)
+library(here)
+library(cmdstanr)
+library(posterior)
+
+# ===== Load data =====
+fisher_all <- readRDS(here("data", "processed", "fisher_all.rds"))
+
+if (!"session" %in% colnames(fisher_all)) {
+  fisher_all <- fisher_all %>%
+    group_by(ID) %>%
+    arrange(start_time) %>%
+    mutate(session = cumsum(replace_na(gap_hrs > 72, FALSE)) + 1) %>%
+    ungroup()
+}
+
+# Settings
+target_item <- "down"  # Run on `down` first; replicate on others later
+N_HOLDOUT_BEEPS <- 12  # Approximately last 3 days at 4 beeps/day
+
+# ===== Prepare train/test split =====
+
+prep_split <- fisher_all %>%
+  filter(session == 1) %>%
+  drop_na(all_of(target_item)) %>%
+  group_by(ID) %>%
+  arrange(start_time) %>%
+  mutate(
+    y_z = as.numeric(scale(.data[[target_item]])),
+    y_lag1 = lag(y_z, 1),
+    beep_num = row_number(),
+    total_beeps = n()
+  ) %>%
+  ungroup() %>%
+  drop_na(y_z, y_lag1) %>%
+  # Mark last N_HOLDOUT_BEEPS per person as test
+  group_by(ID) %>%
+  mutate(
+    is_test = beep_num > (max(beep_num) - N_HOLDOUT_BEEPS)
+  ) %>%
+  ungroup() %>%
+  mutate(person = as.integer(as.factor(ID)))
+
+train <- prep_split %>% filter(!is_test)
+test <- prep_split %>% filter(is_test)
+
+cat("Train obs:", nrow(train), " | Test obs:", nrow(test), "\n")
+cat("Persons:", n_distinct(prep_split$person), "\n")
+cat("Avg test beeps per person:", round(nrow(test)/n_distinct(prep_split$person), 1), "\n")
+
+# Output directory
+dir.create(here("output", "prediction"), recursive = TRUE, showWarnings = FALSE)
+
+# ===== Method 1: Group-only DTVEM (single a, single sigma) =====
+cat("\n--- Method 1: Group-only DTVEM ---\n")
+
+# Simple OLS on pooled data
+fit_group <- lm(y_z ~ y_lag1 - 1, data = train)
+a_group <- coef(fit_group)["y_lag1"]
+sigma_group <- summary(fit_group)$sigma
+
+cat("a_group:", round(a_group, 3), " | sigma_group:", round(sigma_group, 3), "\n")
+
+# Predict held-out
+test$pred_group <- a_group * test$y_lag1
+test$loglik_group <- dnorm(test$y_z, mean = test$pred_group, 
+                            sd = sigma_group, log = TRUE)
+
+# ===== Method 2: Naive per-person DTVEM =====
+cat("\n--- Method 2: Naive per-person DTVEM ---\n")
+
+per_person_fits <- train %>%
+  group_by(ID, person) %>%
+  summarise(
+    n_train = n(),
+    a_naive = coef(lm(y_z ~ y_lag1 - 1))[1],
+    sigma_naive = summary(lm(y_z ~ y_lag1 - 1))$sigma,
+    .groups = "drop"
+  )
+
+# Some persons may have very few train obs and unstable estimates; clip to range
+per_person_fits <- per_person_fits %>%
+  mutate(
+    a_naive = pmax(pmin(a_naive, 0.99), -0.99),
+    sigma_naive = pmax(sigma_naive, 0.1)
+  )
+
+cat("Per-person a range:", round(range(per_person_fits$a_naive), 3), "\n")
+
+# Predict held-out
+test <- test %>%
+  left_join(per_person_fits %>% select(person, a_naive, sigma_naive), by = "person") %>%
+  mutate(
+    pred_naive = a_naive * y_lag1,
+    loglik_naive = dnorm(y_z, mean = pred_naive, sd = sigma_naive, log = TRUE)
+  )
+
+# ===== Method 3: Hierarchical lag-1 in Stan (= our DTVEM-RE without sigma hierarchy) =====
+cat("\n--- Method 3: Hierarchical lag-1 (mlVAR-style baseline) ---\n")
+
+# Build a simpler Stan model with hierarchical a but single sigma
+simple_stan_code <- "
+data {
+  int<lower=1> N;
+  int<lower=1> P;
+  array[N] int<lower=1,upper=P> person;
+  vector[N] y;
+  vector[N] y_lag1;
+}
+parameters {
+  real mu_a;
+  real<lower=0> tau_a;
+  vector[P] a_raw;
+  real<lower=0> sigma;
+}
+transformed parameters {
+  vector[P] a = mu_a + tau_a * a_raw;
+}
+model {
+  mu_a ~ normal(0, 0.5);
+  tau_a ~ normal(0, 0.3);
+  a_raw ~ std_normal();
+  sigma ~ normal(0.9, 0.3);
+  for (n in 1:N) {
+    y[n] ~ normal(a[person[n]] * y_lag1[n], sigma);
+  }
+}
+"
+
+# Write to temp file
+simple_stan_file <- tempfile(fileext = ".stan")
+writeLines(simple_stan_code, simple_stan_file)
+
+mod_simple <- cmdstan_model(simple_stan_file)
+
+stan_data_simple <- list(
+  N = nrow(train),
+  P = n_distinct(train$person),
+  person = train$person,
+  y = train$y_z,
+  y_lag1 = train$y_lag1
+)
+
+fit_simple <- mod_simple$sample(
+  data = stan_data_simple,
+  chains = 4, parallel_chains = 4,
+  iter_warmup = 1000, iter_sampling = 1000,
+  seed = 123, refresh = 0
+)
+
+a_simple <- fit_simple$summary("a")$mean
+sigma_simple <- fit_simple$summary("sigma")$mean
+
+test <- test %>%
+  mutate(
+    a_simple = a_simple[person],
+    pred_simple = a_simple * y_lag1,
+    loglik_simple = dnorm(y_z, mean = pred_simple, sd = sigma_simple, log = TRUE)
+  )
+
+# ===== Method 4: Full DTVEM-RE (v2 model with hierarchical sigma) =====
+cat("\n--- Method 4: Full DTVEM-RE ---\n")
+
+mod_full <- cmdstan_model(here("stan", "dtvem_re_lag1_v2.stan"))
+
+stan_data_full <- list(
+  N = nrow(train),
+  P = n_distinct(train$person),
+  person = train$person,
+  y = train$y_z,
+  y_lag1 = train$y_lag1
+)
+
+fit_full <- mod_full$sample(
+  data = stan_data_full,
+  chains = 4, parallel_chains = 4,
+  iter_warmup = 1000, iter_sampling = 1000,
+  seed = 123, refresh = 0, adapt_delta = 0.95
+)
+
+a_full <- fit_full$summary("a")$mean
+sigma_full <- fit_full$summary("sigma")$mean
+
+test <- test %>%
+  mutate(
+    a_full = a_full[person],
+    sigma_full = sigma_full[person],
+    pred_full = a_full * y_lag1,
+    loglik_full = dnorm(y_z, mean = pred_full, sd = sigma_full, log = TRUE)
+  )
+
+# ===== Compare methods =====
+cat("\n\n==== HELD-OUT PREDICTION RESULTS ====\n")
+
+method_summary <- tibble(
+  method = c("1. Group-only DTVEM", "2. Naive per-person", 
+             "3. Hierarchical (mlVAR)", "4. DTVEM-RE (full)"),
+  mean_loglik = c(mean(test$loglik_group),
+                   mean(test$loglik_naive),
+                   mean(test$loglik_simple),
+                   mean(test$loglik_full)),
+  total_loglik = c(sum(test$loglik_group),
+                    sum(test$loglik_naive),
+                    sum(test$loglik_simple),
+                    sum(test$loglik_full)),
+  rmse = c(sqrt(mean((test$y_z - test$pred_group)^2)),
+            sqrt(mean((test$y_z - test$pred_naive)^2)),
+            sqrt(mean((test$y_z - test$pred_simple)^2)),
+            sqrt(mean((test$y_z - test$pred_full)^2)))
+)
+
+print(method_summary %>% mutate(across(where(is.numeric), ~round(.x, 4))))
+
+write_csv(method_summary, here("output", "prediction", 
+                                paste0("comparison_", target_item, ".csv")))
+
+# ===== Per-person comparison: where does DTVEM-RE help most? =====
+per_person_loglik <- test %>%
+  group_by(person, ID) %>%
+  summarise(
+    n_test = n(),
+    ll_group = mean(loglik_group),
+    ll_naive = mean(loglik_naive),
+    ll_simple = mean(loglik_simple),
+    ll_full = mean(loglik_full),
+    .groups = "drop"
+  ) %>%
+  left_join(per_person_fits %>% select(person, n_train), by = "person") %>%
+  mutate(
+    full_vs_group = ll_full - ll_group,
+    full_vs_naive = ll_full - ll_naive,
+    full_vs_simple = ll_full - ll_simple
+  )
+
+cat("\n=== Per-person DTVEM-RE advantage ===\n")
+cat("DTVEM-RE vs Group-only: mean ", round(mean(per_person_loglik$full_vs_group), 4),
+    "| % better: ", round(mean(per_person_loglik$full_vs_group > 0) * 100, 1), "%\n")
+cat("DTVEM-RE vs Naive:      mean ", round(mean(per_person_loglik$full_vs_naive), 4),
+    "| % better: ", round(mean(per_person_loglik$full_vs_naive > 0) * 100, 1), "%\n")
+cat("DTVEM-RE vs Hier-simple: mean ", round(mean(per_person_loglik$full_vs_simple), 4),
+    "| % better: ", round(mean(per_person_loglik$full_vs_simple > 0) * 100, 1), "%\n")
+
+# ===== Plots =====
+
+# Plot 1: methods compared
+p1 <- method_summary %>%
+  ggplot(aes(x = reorder(method, mean_loglik), y = mean_loglik)) +
+  geom_col(fill = "steelblue", alpha = 0.7) +
+  geom_text(aes(label = round(mean_loglik, 4)), 
+            vjust = -0.5, size = 4) +
+  labs(
+    title = paste0("Held-out predictive log-likelihood (", target_item, ")"),
+    subtitle = paste0("Higher is better. ", nrow(test), " held-out beeps across 40 people."),
+    x = "Method",
+    y = "Mean log-likelihood per held-out beep"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+
+print(p1)
+ggsave(here("output", "prediction", paste0("methods_comparison_", target_item, ".png")),
+       p1, width = 9, height = 6, dpi = 150)
+
+# Plot 2: per-person DTVEM-RE advantage over naive
+p2 <- per_person_loglik %>%
+  arrange(full_vs_naive) %>%
+  mutate(rank = row_number()) %>%
+  ggplot(aes(x = rank, y = full_vs_naive)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_col(aes(fill = full_vs_naive > 0)) +
+  scale_fill_manual(values = c("FALSE" = "coral", "TRUE" = "steelblue"),
+                    name = "DTVEM-RE wins?") +
+  labs(
+    title = "Per-person prediction: DTVEM-RE vs Naive per-person",
+    subtitle = "Positive bars = DTVEM-RE predicts better; ranked by advantage",
+    x = "Person (ranked)",
+    y = "Log-likelihood improvement"
+  ) +
+  theme_minimal(base_size = 12)
+
+print(p2)
+ggsave(here("output", "prediction", paste0("per_person_advantage_", target_item, ".png")),
+       p2, width = 10, height = 6, dpi = 150)
+
+saveRDS(per_person_loglik, here("output", "prediction", 
+                                  paste0("per_person_results_", target_item, ".rds")))
+
+cat("\nDone. Outputs in output/prediction/.\n")
+```
+
+```{r}
+# R/14_small_n_prediction.R
+# Test whether DTVEM-RE's predictive advantage grows at smaller per-person T.
+# Same setup as R/13_held_out_prediction.R but with three training-data sizes.
+
+library(tidyverse)
+library(here)
+library(cmdstanr)
+
+# ===== Settings =====
+target_item <- "down"
+T_TRAIN_LEVELS <- c(30, 50, 100)
+N_HOLDOUT_BEEPS <- 12
+
+# ===== Load data =====
+fisher_all <- readRDS(here("data", "processed", "fisher_all.rds"))
+
+if (!"session" %in% colnames(fisher_all)) {
+  fisher_all <- fisher_all %>%
+    group_by(ID) %>%
+    arrange(start_time) %>%
+    mutate(session = cumsum(replace_na(gap_hrs > 72, FALSE)) + 1) %>%
+    ungroup()
+}
+
+# ===== Prepare data =====
+prep_full <- fisher_all %>%
+  filter(session == 1) %>%
+  drop_na(all_of(target_item)) %>%
+  group_by(ID) %>%
+  arrange(start_time) %>%
+  mutate(
+    y_z = as.numeric(scale(.data[[target_item]])),
+    y_lag1 = lag(y_z, 1),
+    beep_num = row_number(),
+    total_beeps = n()
+  ) %>%
+  ungroup() %>%
+  drop_na(y_z, y_lag1) %>%
+  mutate(person = as.integer(as.factor(ID)))
+
+# Compile Stan models
+mod_full <- cmdstan_model(here("stan", "dtvem_re_lag1_v2.stan"))
+
+# Simple hierarchical model (shared sigma)
+simple_stan_code <- "
+data {
+  int<lower=1> N;
+  int<lower=1> P;
+  array[N] int<lower=1,upper=P> person;
+  vector[N] y;
+  vector[N] y_lag1;
+}
+parameters {
+  real mu_a;
+  real<lower=0> tau_a;
+  vector[P] a_raw;
+  real<lower=0> sigma;
+}
+transformed parameters {
+  vector[P] a = mu_a + tau_a * a_raw;
+}
+model {
+  mu_a ~ normal(0, 0.5);
+  tau_a ~ normal(0, 0.3);
+  a_raw ~ std_normal();
+  sigma ~ normal(0.9, 0.3);
+  for (n in 1:N) {
+    y[n] ~ normal(a[person[n]] * y_lag1[n], sigma);
+  }
+}
+"
+simple_stan_file <- tempfile(fileext = ".stan")
+writeLines(simple_stan_code, simple_stan_file)
+mod_simple <- cmdstan_model(simple_stan_file)
+
+# ===== Function to run all 4 methods at one T_train level =====
+run_comparison <- function(T_train) {
+  cat(sprintf("\n\n========== T_train = %d ==========\n", T_train))
+  
+  # Create train/test split with limited T_train
+  prep_split <- prep_full %>%
+    group_by(person) %>%
+    arrange(beep_num) %>%
+    mutate(
+      # Determine the cutoff: use first T_train beeps for train,
+      # then skip ahead and use the last N_HOLDOUT_BEEPS as test.
+      # Held-out beeps are always the most recent N_HOLDOUT_BEEPS.
+      max_beep = max(beep_num),
+      is_train = beep_num <= T_train,
+      is_test = beep_num > (max_beep - N_HOLDOUT_BEEPS)
+    ) %>%
+    ungroup()
+  
+  train <- prep_split %>% filter(is_train)
+  test <- prep_split %>% filter(is_test)
+  
+  cat(sprintf("Train: %d obs (~%d per person)\n", nrow(train), 
+              round(nrow(train) / n_distinct(train$person))))
+  cat(sprintf("Test: %d obs (~%d per person)\n", nrow(test),
+              round(nrow(test) / n_distinct(test$person))))
+  
+  # --- Method 1: Group-only OLS ---
+  fit_group <- lm(y_z ~ y_lag1 - 1, data = train)
+  a_group <- coef(fit_group)["y_lag1"]
+  sigma_group <- summary(fit_group)$sigma
+  
+  test$pred_group <- a_group * test$y_lag1
+  test$loglik_group <- dnorm(test$y_z, test$pred_group, sigma_group, log = TRUE)
+  
+  # --- Method 2: Naive per-person OLS ---
+  per_person_fits <- train %>%
+    group_by(person) %>%
+    summarise(
+      n_train = n(),
+      a_naive = ifelse(n_train >= 3,
+                       coef(lm(y_z ~ y_lag1 - 1))[1], 0),
+      sigma_naive = ifelse(n_train >= 3,
+                           summary(lm(y_z ~ y_lag1 - 1))$sigma, 1),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      a_naive = pmax(pmin(a_naive, 0.99), -0.99),
+      sigma_naive = pmax(sigma_naive, 0.1)
+    )
+  
+  test <- test %>%
+    left_join(per_person_fits %>% select(person, a_naive, sigma_naive), 
+              by = "person") %>%
+    mutate(
+      pred_naive = a_naive * y_lag1,
+      loglik_naive = dnorm(y_z, pred_naive, sigma_naive, log = TRUE)
+    )
+  
+  # --- Method 3: Hierarchical simple (mlVAR-style) ---
+  stan_data <- list(
+    N = nrow(train), P = n_distinct(train$person),
+    person = train$person, y = train$y_z, y_lag1 = train$y_lag1
+  )
+  
+  fit_simple <- mod_simple$sample(
+    data = stan_data, chains = 4, parallel_chains = 4,
+    iter_warmup = 1000, iter_sampling = 1000,
+    seed = 123, refresh = 0
+  )
+  
+  a_simple <- fit_simple$summary("a")$mean
+  sigma_simple <- fit_simple$summary("sigma")$mean
+  
+  test <- test %>%
+    mutate(
+      a_simple = a_simple[person],
+      pred_simple = a_simple * y_lag1,
+      loglik_simple = dnorm(y_z, pred_simple, sigma_simple, log = TRUE)
+    )
+  
+  # --- Method 4: Full DTVEM-RE ---
+  fit_full <- mod_full$sample(
+    data = stan_data, chains = 4, parallel_chains = 4,
+    iter_warmup = 1000, iter_sampling = 1000,
+    seed = 123, refresh = 0, adapt_delta = 0.95
+  )
+  
+  a_full <- fit_full$summary("a")$mean
+  sigma_full <- fit_full$summary("sigma")$mean
+  
+  test <- test %>%
+    mutate(
+      a_full = a_full[person],
+      sigma_full = sigma_full[person],
+      pred_full = a_full * y_lag1,
+      loglik_full = dnorm(y_z, pred_full, sigma_full, log = TRUE)
+    )
+  
+  # Summary table
+  summary_row <- tibble(
+    T_train = T_train,
+    method = c("Group-only", "Naive per-person", "Hierarchical simple", "DTVEM-RE"),
+    mean_loglik = c(mean(test$loglik_group),
+                     mean(test$loglik_naive),
+                     mean(test$loglik_simple),
+                     mean(test$loglik_full)),
+    rmse = c(sqrt(mean((test$y_z - test$pred_group)^2)),
+              sqrt(mean((test$y_z - test$pred_naive)^2)),
+              sqrt(mean((test$y_z - test$pred_simple)^2)),
+              sqrt(mean((test$y_z - test$pred_full)^2)))
+  )
+  
+  # DTVEM-RE advantage stats
+  advantage <- tibble(
+    T_train = T_train,
+    full_vs_group = mean(test$loglik_full - test$loglik_group),
+    full_vs_naive = mean(test$loglik_full - test$loglik_naive),
+    full_vs_simple = mean(test$loglik_full - test$loglik_simple),
+    pct_full_beats_naive = mean(test$loglik_full > test$loglik_naive) * 100
+  )
+  
+  cat("\nMethod comparison:\n")
+  print(summary_row %>% mutate(across(where(is.numeric), ~round(.x, 4))))
+  
+  cat("\nDTVEM-RE advantage:\n")
+  print(advantage %>% mutate(across(where(is.numeric), ~round(.x, 4))))
+  
+  list(summary = summary_row, advantage = advantage)
+}
+
+# ===== Run for each T_train level =====
+all_results <- map(T_TRAIN_LEVELS, run_comparison)
+
+# ===== Aggregate =====
+dir.create(here("output", "prediction"), recursive = TRUE, showWarnings = FALSE)
+
+all_summary <- map_dfr(all_results, "summary")
+all_advantage <- map_dfr(all_results, "advantage")
+
+cat("\n\n=========== ACROSS ALL T_TRAIN LEVELS ===========\n")
+cat("\nMethod log-likelihoods:\n")
+print(all_summary %>% 
+        pivot_wider(id_cols = T_train, names_from = method, values_from = mean_loglik) %>%
+        mutate(across(where(is.numeric), ~round(.x, 4))))
+
+cat("\nDTVEM-RE advantage by T_train:\n")
+print(all_advantage %>% mutate(across(where(is.numeric), ~round(.x, 4))))
+
+write_csv(all_summary, here("output", "prediction", "small_n_summary.csv"))
+write_csv(all_advantage, here("output", "prediction", "small_n_advantage.csv"))
+
+# ===== Visualization =====
+p_comparison <- all_summary %>%
+  ggplot(aes(x = factor(T_train), y = mean_loglik, fill = method)) +
+  geom_col(position = "dodge") +
+  geom_text(aes(label = round(mean_loglik, 3)), 
+            position = position_dodge(0.9), vjust = -0.5, size = 3) +
+  labs(
+    title = paste0("Held-out prediction by training sample size (", target_item, ")"),
+    subtitle = "Higher log-likelihood = better; comparison across methods at varying T_train",
+    x = "Training observations per person",
+    y = "Mean log-likelihood per held-out beep"
+  ) +
+  theme_minimal(base_size = 12)
+
+print(p_comparison)
+ggsave(here("output", "prediction", "small_n_comparison.png"),
+       p_comparison, width = 11, height = 6, dpi = 150)
+
+p_advantage <- all_advantage %>%
+  select(T_train, full_vs_group, full_vs_naive, full_vs_simple) %>%
+  pivot_longer(-T_train, names_to = "comparison", values_to = "advantage") %>%
+  mutate(comparison = recode(comparison,
+                              full_vs_group = "vs Group-only",
+                              full_vs_naive = "vs Naive per-person",
+                              full_vs_simple = "vs Hierarchical simple")) %>%
+  ggplot(aes(x = factor(T_train), y = advantage, fill = comparison)) +
+  geom_col(position = "dodge") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  labs(
+    title = "DTVEM-RE predictive advantage shrinks as T_train grows",
+    subtitle = "Positive = DTVEM-RE wins; hypothesis: pooling matters most when per-person T is small",
+    x = "Training observations per person",
+    y = "Log-likelihood improvement over comparison method",
+    fill = "DTVEM-RE compared to:"
+  ) +
+  theme_minimal(base_size = 12)
+
+print(p_advantage)
+ggsave(here("output", "prediction", "small_n_advantage.png"),
+       p_advantage, width = 10, height = 6, dpi = 150)
+
+cat("\nDone. Outputs in output/prediction/.\n")
+```
+
+```{r}
+# R/15_fit_stan_multilag.R
+# Fit the multi-lag DTVEM-RE model on Fisher's three core items.
+# Tests whether person-specific variation extends beyond lag-1.
+
+library(tidyverse)
+library(here)
+library(cmdstanr)
+library(posterior)
+
+# === Settings ===
+K_LAGS <- 3      # estimate lag-1, lag-2, lag-3
+TARGET_ITEMS <- c("down", "worried", "energetic")
+
+# === Load data ===
+fisher_all <- readRDS(here("data", "processed", "fisher_all.rds"))
+
+if (!"session" %in% colnames(fisher_all)) {
+  fisher_all <- fisher_all %>%
+    group_by(ID) %>%
+    arrange(start_time) %>%
+    mutate(session = cumsum(replace_na(gap_hrs > 72, FALSE)) + 1) %>%
+    ungroup()
+}
+
+# === Compile model ===
+cat("Compiling multi-lag Stan model...\n")
+mod <- cmdstan_model(here("stan", "dtvem_re_multilag.stan"))
+cat("Compilation done.\n")
+
+# === Fit function ===
+fit_one_item <- function(item) {
+  cat(sprintf("\n\n=========== FITTING: %s ===========\n", item))
+  
+  # Build lag-augmented dataset with K lags
+  prep <- fisher_all %>%
+    filter(session == 1) %>%
+    drop_na(all_of(item)) %>%
+    group_by(ID) %>%
+    arrange(start_time) %>%
+    mutate(
+      y_z = as.numeric(scale(.data[[item]]))
+    ) %>%
+    ungroup()
+  
+  # Add lagged columns
+  for (k in 1:K_LAGS) {
+    prep <- prep %>%
+      group_by(ID) %>%
+      arrange(start_time) %>%
+      mutate("y_lag{k}" := lag(y_z, k)) %>%
+      ungroup()
+  }
+  
+  # Drop rows with any NA in lagged values
+  lag_cols <- paste0("y_lag", 1:K_LAGS)
+  prep <- prep %>%
+    drop_na(y_z, all_of(lag_cols)) %>%
+    mutate(person = as.integer(as.factor(ID)))
+  
+  cat("Observations after lag construction:", nrow(prep), "\n")
+  cat("Persons:", n_distinct(prep$person), "\n")
+  
+  # Build y_lags matrix
+  y_lags_matrix <- as.matrix(prep[, lag_cols])
+  
+  stan_data <- list(
+    N = nrow(prep),
+    P = n_distinct(prep$person),
+    K = K_LAGS,
+    person = prep$person,
+    y = prep$y_z,
+    y_lags = y_lags_matrix
+  )
+  
+  # Fit
+  fit <- mod$sample(
+    data = stan_data,
+    chains = 4, parallel_chains = 4,
+    iter_warmup = 1000, iter_sampling = 1000,
+    seed = 42, refresh = 200,
+    adapt_delta = 0.95
+  )
+  
+  # Diagnostics
+  diag <- fit$diagnostic_summary()
+  cat("\n--- Diagnostics ---\n")
+  cat("Total divergences:", sum(diag$num_divergent), "\n")
+  cat("Min E-BFMI:", round(min(diag$ebfmi), 3), "\n")
+  
+  # Save
+  dir.create(here("output", "stan_fits"), recursive = TRUE, showWarnings = FALSE)
+  fit$save_object(here("output", "stan_fits", paste0("multilag_", item, ".rds")))
+  
+  # Summarize population parameters
+  pop_summary <- fit$summary(variables = c("mu_a", "tau_a", "sigma_mean", 
+                                            "sigma_sd", "prop_var_from_persons"))
+  cat("\n--- Population-level parameters ---\n")
+  print(pop_summary %>% mutate(across(where(is.numeric), ~round(.x, 4))))
+  
+  list(item = item, fit = fit, pop_summary = pop_summary, n_obs = nrow(prep))
+}
+
+# === Run for all three items ===
+all_fits <- map(TARGET_ITEMS, fit_one_item)
+names(all_fits) <- TARGET_ITEMS
+
+# === Build cross-item summary ===
+cat("\n\n=========== CROSS-ITEM MULTI-LAG SUMMARY ===========\n")
+
+build_lag_summary <- function(res) {
+  s <- res$pop_summary %>%
+    filter(str_detect(variable, "mu_a\\[|tau_a\\[")) %>%
+    separate(variable, into = c("param", "lag"), sep = "\\[") %>%
+    mutate(
+      lag = as.integer(str_remove(lag, "\\]")),
+      item = res$item
+    ) %>%
+    select(item, param, lag, mean, sd, q5, q95)
+  s
+}
+
+multilag_summary <- map_dfr(all_fits, build_lag_summary)
+
+# Format for display
+display_table <- multilag_summary %>%
+  mutate(
+    param = if_else(param == "mu_a", "μ", "τ"),
+    estimate = sprintf("%.3f [%.3f, %.3f]", mean, q5, q95)
+  ) %>%
+  select(item, param, lag, estimate) %>%
+  pivot_wider(names_from = c(param, lag), values_from = estimate,
+              names_glue = "{param}_lag{lag}")
+
+print(display_table)
+
+write_csv(multilag_summary, here("output", "stan_fits", "multilag_summary.csv"))
+
+# === Key plots ===
+
+# Plot 1: tau_k across lags and items — does heterogeneity drop off at higher lags?
+p_tau <- multilag_summary %>%
+  filter(param == "tau_a") %>%
+  ggplot(aes(x = lag, y = mean, color = item)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_errorbar(aes(ymin = q5, ymax = q95), width = 0.15, position = position_dodge(0.3)) +
+  geom_point(size = 3, position = position_dodge(0.3)) +
+  geom_line(position = position_dodge(0.3)) +
+  scale_x_continuous(breaks = 1:K_LAGS) +
+  labs(
+    title = "Between-person SD (τ_k) at each lag",
+    subtitle = "If τ_k > 0 for k > 1, person-specific variation extends beyond lag-1",
+    x = "Lag",
+    y = "τ_k (with 90% CI)",
+    color = "Item"
+  ) +
+  theme_minimal(base_size = 12)
+
+print(p_tau)
+ggsave(here("output", "stan_fits", "multilag_tau_by_lag.png"),
+       p_tau, width = 9, height = 6, dpi = 150)
+
+# Plot 2: mu_k across lags — confirms population-level exponential decay
+p_mu <- multilag_summary %>%
+  filter(param == "mu_a") %>%
+  ggplot(aes(x = lag, y = mean, color = item)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_errorbar(aes(ymin = q5, ymax = q95), width = 0.15, position = position_dodge(0.3)) +
+  geom_point(size = 3, position = position_dodge(0.3)) +
+  geom_line(position = position_dodge(0.3)) +
+  scale_x_continuous(breaks = 1:K_LAGS) +
+  labs(
+    title = "Population-level lag coefficients (μ_k) at each lag",
+    subtitle = "Expect monotonic decay if Fisher's dynamics follow exponential decay",
+    x = "Lag",
+    y = "μ_k (with 90% CI)",
+    color = "Item"
+  ) +
+  theme_minimal(base_size = 12)
+
+print(p_mu)
+ggsave(here("output", "stan_fits", "multilag_mu_by_lag.png"),
+       p_mu, width = 9, height = 6, dpi = 150)
+
+# Plot 3: Person-specific multi-lag profiles (down only, for clarity)
+fit_down <- all_fits$down$fit
+person_summary <- fit_down$summary(variables = "a") %>%
+  filter(str_detect(variable, "a\\[")) %>%
+  separate(variable, into = c("a_label", "indices"), sep = "\\[") %>%
+  separate(indices, into = c("lag", "person"), sep = ",") %>%
+  mutate(
+    lag = as.integer(lag),
+    person = as.integer(str_remove(person, "\\]"))
+  ) %>%
+  select(lag, person, mean, q5, q95)
+
+p_persons <- person_summary %>%
+  ggplot(aes(x = lag, y = mean, group = person)) +
+  geom_line(alpha = 0.25, color = "steelblue") +
+  stat_summary(aes(group = 1), fun = mean, geom = "line",
+               color = "red", linewidth = 1.4) +
+  scale_x_continuous(breaks = 1:K_LAGS) +
+  labs(
+    title = "Person-specific lag profiles: down (multi-lag fit)",
+    subtitle = "Blue = individual; Red = population average",
+    x = "Lag",
+    y = "Lag coefficient"
+  ) +
+  theme_minimal(base_size = 12)
+
+print(p_persons)
+ggsave(here("output", "stan_fits", "multilag_person_profiles_down.png"),
+       p_persons, width = 9, height = 6, dpi = 150)
+
+cat("\nDone. Outputs in output/stan_fits/.\n")
+```
